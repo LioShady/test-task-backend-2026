@@ -22,15 +22,11 @@ class AmoCrmRepeatError(Exception):
 
 
 class AmoCrmNoConten(Exception):
-    """
-    amocrm error not found
-    """
+    """amocrm error not found"""
 
 
 class AmoCrmSearchError(Exception):
-    """
-    amocrm error when search
-    """
+    """amocrm error when search"""
 
 
 class AmoCrmError(Exception):
@@ -54,20 +50,16 @@ class AmoCrmError(Exception):
 
 
 class AmoCrmCompaniesMoreThanOne(Exception):
-    """
-    amocrm error when found companies > 1
-    """
+    """amocrm error when found companies > 1"""
 
 
 class BaseEntity:
-    """
-    base class for entity
-    """
-    schema = None
     entity_name = None
     url = None
     custom_fields_values = None
     PATCH_FIELDS = None
+    # Поля, которые не должны попадать в api_value (служебные/производные).
+    _API_VALUE_EXCLUDE = frozenset({'_new_next_date', '_embedded'})
 
     def __str__(self):
         return f"<{type(self).__name__}: {self.name}, {self.id}>"
@@ -76,9 +68,16 @@ class BaseEntity:
         return str(self)
 
     def get_field(self, field_name):
-        return self.custom_fields_values.get(field_name, {}).get('value')
+        if not self.custom_fields_values:
+            return None
+        field = self.custom_fields_values.get(field_name)
+        if not field:
+            return None
+        return field.get('value')
 
     def set_field(self, field_name, field_value, field_id=None):
+        if self.custom_fields_values is None:
+            self.custom_fields_values = {}
         custom_field = self.custom_fields_values.get(field_name)
         if custom_field is None:
             if field_id is None:
@@ -93,38 +92,30 @@ class BaseEntity:
         else:
             raise ValueError(f"Custom field {field_name} without id")
 
+    def as_dict(self):
+        """Сырой ответ API: собираем из атрибутов, минуя служебные.
+
+        _embedded, contacts и companies исключены: они вынесены
+        в отдельные таблицы.
+        """
+        skip = self._API_VALUE_EXCLUDE | {'contacts', 'companies', 'tags'}
+        return {
+            k: v for k, v in vars(self).items()
+            if not k.startswith('_') and k not in skip
+        }
+
     def get_url(self):
         return self.url
 
 
 class Customer(BaseEntity):
-    """
-    class for amocrm customer
-    """
     url = "api/v4/customers"
     entity_name = CUSTOMERS
 
-    def __init__(self,
-                 id,
-                 name,
-                 next_price,
-                 next_date,
-                 responsible_user_id,
-                 status_id,
-                 periodicity,
-                 created_by,
-                 updated_by,
-                 created_at,
-                 updated_at,
-                 closest_task_at,
-                 is_deleted,
-                 ltv,
-                 purchases_count,
-                 average_check,
-                 account_id,
-                 custom_fields_values,
-                 _embedded=None
-                 ):
+    def __init__(self, id, name, next_price, next_date, responsible_user_id,
+                 status_id, periodicity, created_by, updated_by, created_at,
+                 updated_at, closest_task_at, is_deleted, ltv, purchases_count,
+                 average_check, account_id, custom_fields_values, _embedded=None):
         self.id = id
         self.name = name
         self.next_price = next_price
@@ -157,33 +148,15 @@ class Customer(BaseEntity):
 
 
 class Lead(BaseEntity):
-    """
-    class for amocrm lead
-    """
     url = "api/v4/leads"
     entity_name = LEADS
     PATCH_FIELDS = ("custom_fields_values", "id")
 
-    def __init__(self,
-                 name=None,
-                 id=None,
-                 price=None,
-                 responsible_user_id=None,
-                 group_id=None,
-                 status_id=None,
-                 pipeline_id=None,
-                 source_id=None,
-                 created_by=None,
-                 updated_by=None,
-                 created_at=None,
-                 updated_at=None,
-                 closest_task_at=None,
-                 is_deleted=None,
-                 score=None,
-                 account_id=None,
-                 custom_fields_values=None,
-                 _embedded=None
-                 ):
+    def __init__(self, name=None, id=None, price=None, responsible_user_id=None,
+                 group_id=None, status_id=None, pipeline_id=None, source_id=None,
+                 created_by=None, updated_by=None, created_at=None, updated_at=None,
+                 closest_task_at=None, is_deleted=None, score=None, account_id=None,
+                 custom_fields_values=None, _embedded=None):
         self.id = id
         self.name = name
         self.price = price
@@ -205,8 +178,24 @@ class Lead(BaseEntity):
         self.tags = []
         self.contacts = []
         self.companies = []
-        if not _embedded:
-            return
+
+
+NETWORK_RETRIES = 4
+NETWORK_BACKOFF = 1.0  # сек, умножается на номер попытки
+
+
+_ENTITY_EXTRA_KEYS = frozenset({'tags', 'contacts', 'companies'})
+
+
+def _build_entity(obj_cls: Type[BaseEntity], item: dict) -> BaseEntity:
+    """Конструирует сущность из ответа API.
+    Лишние ключи (например, tags у Lead) отбрасываем.
+    """
+    try:
+        return obj_cls(**item)
+    except TypeError:
+        filtered = {k: v for k, v in item.items() if k not in _ENTITY_EXTRA_KEYS}
+        return obj_cls(**filtered)
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -228,76 +217,79 @@ def amocrm_get(obj_cls: Type[BaseEntity],
                 filter_key = f'{filter_key}[]'
             params[filter_key] = value
     if _with:
-        if isinstance(_with, list):
-            params['with'] = ",".join(_with)
-        else:
-            params['with'] = _with
+        params['with'] = ",".join(_with) if isinstance(_with, list) else _with
     if query:
-        params[f'query'] = query
+        params['query'] = query
 
     headers = {}
     base_url = ""
     url = f"{base_url}{obj_cls.url}"
     entity_name = obj_cls.entity_name
-    schema = obj_cls.get_schema(many=True)
 
     while True:
-        response = None
         json_data = None
-        try:
-            for try_attempt in range(4):  # 0..3 — до 4 попыток на один запрос
-                try:
-                    response = requests.get(url, params=params, headers=headers, timeout=120)
-                    json_data = response_handler(response)
-                    break
-                except AmoCrmRepeatError as e:
-                    if try_attempt >= 3:
-                        raise e
-                    # повторить тот же запрос (тот же url, params), без нового get() с начала
-                except AmoCrmNoConten:
+        for attempt in range(NETWORK_RETRIES):
+            response = None
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=120)
+                json_data = response_handler(response)
+                break
+            except AmoCrmRepeatError:
+                if attempt >= NETWORK_RETRIES - 1:
                     raise
-                except Exception as e:
-                    raise AmoCrmError(f"[!] {response.status_code if response else '<No code!>'} |"
-                                      f" Неожиданная AMOCRM ошибка {e} ") from e
-        except AmoCrmNoConten:
-            break
-        if json_data is not None:
-            counter = 0
-            for entity in schema.load(json_data['_embedded'][entity_name]):
-                counter += 1
-                skip_entity = False
-                if custom_filter:
-                    # if custom filter is not None then check custom field,
-                    # if at least one not equal filter, set skip_entity value True and break checker
-                    #
-                    for key, value in custom_filter.items():
-                        if entity.get_field(key) != value:
-                            skip_entity = True
-                            break
-                # check if should pass entity
-                if skip_entity:
-                    pass
-                else:
-                    yield entity
+                # 429 уже поспал в response_handler; повторяем тот же запрос
+                continue
+            except AmoCrmNoConten:
+                json_data = None
+                break
+            except requests.RequestException as e:
+                if attempt >= NETWORK_RETRIES - 1:
+                    raise AmoCrmError(msg=f"network error {e}") from e
+                time.sleep(NETWORK_BACKOFF * (attempt + 1))
+                continue
+            except Exception as e:
+                raise AmoCrmError(
+                    f"[!] {response.status_code if response is not None else '<No code!>'} |"
+                    f" Неожиданная AMOCRM ошибка {e} "
+                ) from e
 
-            # condition to stop while loop
-            if page:
-                break
-            if counter < limit:
-                break
-            time.sleep(1)
-            # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
-            params = {}
+        if json_data is None:
+            # 204/пустой ответ -- дальше страниц нет
+            break
+
+        counter = 0
+        for item in json_data['_embedded'][entity_name]:
+            counter += 1
+            entity = _build_entity(obj_cls, item)
+            if custom_filter:
+                skip_entity = False
+                for key, value in custom_filter.items():
+                    if entity.get_field(key) != value:
+                        skip_entity = True
+                        break
+                if skip_entity:
+                    continue
+            yield entity
+
+        if page:
+            break
+        if counter < limit:
+            break
+        time.sleep(1)
+        next_link = json_data.get('_links', {}).get('next')
+        if not next_link:
+            break
+        url = next_link['href']
+        params = {}
 
 
 def response_handler(response):
     if response.status_code == 204:
         raise AmoCrmNoConten(f"no content for {response.url}, method: {response.request.method}")
-    elif response.status_code == 429:
+    if response.status_code == 429:
         time.sleep(2)
         raise AmoCrmRepeatError()
-    elif response.status_code != 200:
+    if response.status_code != 200:
         json_data = {}
         try:
             json_data = response.json()

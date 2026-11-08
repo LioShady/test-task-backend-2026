@@ -1,175 +1,312 @@
 import logging
-from typing import Iterator, List, Dict
+from datetime import datetime
+from typing import Dict, Iterable, Iterator, List, Tuple
 
-from sqlalchemy import delete, select
-from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy import func, select, update
 
-from abstract_customer import get_abccustomer_by_lead_login, create_or_update_customer, \
-    get_abccustomer_by_amocustomer_login, dict_compare_merge, create_or_update_lead
-from amocrm import Customer, COMPANIES, CONTACTS, Lead, amocrm_get
-from models import db, AbstractCustomer
+from abstract_customer import (
+    company_row, contact_row, customer_login, customer_row,
+    dedup_by_id, delete_abstract_customers,
+    fetch_abstract_customer_ids_by_customer_login,
+    fetch_abstract_customer_ids_by_lead_login,
+    fetch_amo_customers_by_ids, fetch_amo_leads_by_ids,
+    insert_abstract_customers, lead_login, lead_row,
+    reassign_entities_to_customer,
+    upsert_companies, upsert_contacts, upsert_customers, upsert_leads,
+)
+from amocrm import COMPANIES, CONTACTS, Customer, Lead, amocrm_get
+from models import (AbstractCustomer, AmoCompany, AmoContact, AmoCustomer,
+                    AmoLead, db)
 
 logger = logging.getLogger(__name__)
 
-
-def lead_action(lead: Lead):
-    abstract_customer = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_leads.op('@>')([{'general': {'id': lead.id}}])).first()
-    lead_login = lead.get_field('Логин')
-    if lead_login:
-        abs_customer_login = get_abccustomer_by_amocustomer_login(lead_login)
-        if abstract_customer is None:
-            abstract_customer = abs_customer_login
-        if abs_customer_login is not None:
-            if abs_customer_login.id != abstract_customer.id:
-                abstract_customer.amo_customers = dict_compare_merge(abstract_customer.amo_customers or [],
-                                                                     abs_customer_login.amo_customers or [])
-                abstract_customer.amo_leads = dict_compare_merge(abstract_customer.amo_leads or [],
-                                                                 abs_customer_login.amo_leads or [])
-                abstract_customer.amo_contacts = dict_compare_merge(abstract_customer.amo_contacts or [],
-                                                                    abs_customer_login.amo_contacts or [])
-                abstract_customer.amo_companies = dict_compare_merge(abstract_customer.amo_companies or [],
-                                                                     abs_customer_login.amo_companies or [])
-                flag_modified(abstract_customer, "amo_customers")
-                flag_modified(abstract_customer, "amo_leads")
-                flag_modified(abstract_customer, "amo_contacts")
-                flag_modified(abstract_customer, "amo_companies")
-                db.session.commit()
-                db.session.flush()
-                db.session.delete(abs_customer_login)
-                db.session.commit()
-                return
-
-    return create_or_update_lead(abstract_customer, lead)
+BATCH_SIZE = 2000
 
 
-def collect_leads_customers(is_full=True):
-    """
-     Берем всех покупателей, если его нет в бд - делаем новую запись AbstractCutomer, в него кладем.
-     Есть есть - находим его запись по id и перезаписываем
+# --- утилиты ----------------------------------------------------------------
 
-     Вот так у нас коллектятся все кастомеры
+def _chunks(it: Iterable, size: int) -> Iterator[List]:
+    buf = []
+    for x in it:
+        buf.append(x)
+        if len(buf) >= size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
 
-     Далее берутся все лиды. Ищутся их записи в бд по id, если не находится и есть логин
-     - находим его запись по кастомеру с тем же логином, кладем к нему.
-     Если нет логина/нет кастомера - пропускаем. Если нашелся - перезаписываем соответственно
-         abstract_id_customer : {
-        customers: [...],
-        leads: [...],
-        contacts: [...],
-        companies: [...]
-    }
-    """
-    session = db.session
-    customers: Iterator[Customer] = amocrm_get(Customer, _with=f"{COMPANIES},{CONTACTS}")
-    logger.info(f"Collected customers {is_full=}")
 
-    ids_map = {}
-    for customer in customers:
-        if is_full is False and customer.status_id == 111349:
-            continue
-        customer_login = customer.get_field('Логин')
-        if not customer_login:
-            continue
-        abstract_customer = session.query(AbstractCustomer).filter(
-            AbstractCustomer.amo_customers.op('@>')([{'general': {'id': customer.id}}])).first()
+def _now() -> datetime:
+    return datetime.utcnow()
 
-        if not abstract_customer:
-            abstract_customer = get_abccustomer_by_lead_login(customer_login)  # почти всегда логины совпадают
-        abstract_customer = create_or_update_customer(abstract_customer, customer)
-        if is_full is True:
-            if abstract_customer.id in ids_map:
-                ids_map[abstract_customer.id]["customers"].append(customer.id)
-                ids_map[abstract_customer.id]["contacts"].extend([c["id"] for c in customer.contacts])
-                ids_map[abstract_customer.id]["companies"].extend([c["id"] for c in customer.companies])
-            else:
-                ids_map[abstract_customer.id] = {
-                    "customers": [customer.id],
-                    "contacts": [c["id"] for c in customer.contacts],
-                    "companies": [c["id"] for c in customer.companies],
-                    "leads": [],
-                }
-        db.session.commit()
 
-    del customers
-    amo_leads: Iterator[Lead] = amocrm_get(Lead, _with=f"{CONTACTS}")
-    logger.info(f"Collected leads {is_full=}")
-    for amo_lead in amo_leads:
-        if is_full is False and amo_lead.status_id == 143:
-            continue
-        try:
-            abc_customer = lead_action(amo_lead)
-            if is_full is True:
-                if abc_customer.id in ids_map:
-                    ids_map[abc_customer.id]["leads"].append(amo_lead.id)
-                    ids_map[abc_customer.id]["contacts"].extend([c["id"] for c in amo_lead.contacts])
-                else:
-                    ids_map[abc_customer.id] = {
-                        "customers": [],
-                        "contacts": [c["id"] for c in amo_lead.contacts],
-                        "companies": [],
-                        "leads": [amo_lead.id],
-                    }
-        except Exception as e:
-            logger.exception(f'{amo_lead} {e}')
-
-    if is_full is False:
+def _mark_synced(model, ids: List[int], run_start: datetime):
+    if not ids:
         return
-    try:
-        logger.info("Чистка покупателей общая")
-        stmt = delete(AbstractCustomer).where(
-            AbstractCustomer.id.not_in(ids_map.keys())
+    db.session.execute(
+        update(model.__table__)
+        .where(model.id.in_(ids))
+        .values(synced_at=run_start)
+    )
+
+
+def _collect_customers_batch(batch: List[Customer], run_start: datetime,
+                             is_full: bool) -> None:
+    """Обрабатывает пачку покупателей: resolve -> insert новых склеек ->
+    upsert amo_customer -> mark synced."""
+    # 1. Отбрасываем покупателей без логина и (в неполном режиме) по статусу.
+    relevant = []
+    for c in batch:
+        if not is_full and c.status_id == 111349:
+            continue
+        if not customer_login(c):
+            continue
+        relevant.append(c)
+    if not relevant:
+        return
+
+    crm_ids = [c.id for c in relevant]
+    logins = list({customer_login(c) for c in relevant})
+
+    # Существующие amo_customer по id -> их abstract_customer_id.
+    existing_by_id = fetch_amo_customers_by_ids(crm_ids)
+    # Существующие склейки по логину среди сделок (
+    by_lead_login = fetch_abstract_customer_ids_by_lead_login(logins)
+    by_customer_login = fetch_abstract_customer_ids_by_customer_login(logins)
+
+    resolved: Dict[int, int] = {}  # crm_id -> abstract_customer_id
+
+    for c in relevant:
+        login = customer_login(c)
+        existing = existing_by_id.get(c.id)
+        if existing is not None:
+            resolved[c.id] = existing.abstract_customer_id
+            continue
+
+        candidates = set(by_lead_login.get(login, [])) | set(by_customer_login.get(login, []))
+        if len(candidates) > 1:
+            # Если по логину нашлось больше одной записи, то совпадение не используется.
+            logger.warning("Customer %s login %s: more than one abstract_customer %s - create new",
+                           c.id, login, candidates)
+            continue
+        if len(candidates) == 1:
+            resolved[c.id] = next(iter(candidates))
+
+    # Создаём новые склейки пачкой (RETURNING id) и раздаём id покупателям.
+    new_order: List[int] = []  # crm_id в порядке VALUES
+    new_rows: List[Dict] = []
+    for c in relevant:
+        if c.id in resolved:
+            continue
+        new_order.append(c.id)
+        new_rows.append({'send_methods': None})
+    if new_rows:
+        inserted_ids = insert_abstract_customers(new_rows)
+        if len(inserted_ids) != len(new_order):
+            raise RuntimeError(
+                f"insert_abstract_customers returned {len(inserted_ids)} ids "
+                f"for {len(new_order)} rows -- cannot map reliably"
+            )
+        for crm_id, ac_id in zip(new_order, inserted_ids):
+            resolved[crm_id] = ac_id
+
+    # Готовим строки amo_customer и вложенные сущности.
+    customer_rows = [customer_row(c, resolved[c.id]) for c in relevant]
+
+    contact_rows: List[Dict] = []
+    company_rows: List[Dict] = []
+    for c in relevant:
+        ac_id = resolved[c.id]
+        for contact in (c.contacts or []):
+            if contact.get('id') is None:
+                continue
+            contact_rows.append(contact_row(contact, ac_id))
+        for company in (c.companies or []):
+            if company.get('id') is None:
+                continue
+            company_rows.append(company_row(company, ac_id))
+
+    # Bulk upsert + отметка synced_at
+    upsert_customers(customer_rows)
+    upsert_contacts(contact_rows)
+    upsert_companies(company_rows)
+
+    _mark_synced(AmoCustomer, [c.id for c in relevant], run_start)
+    if contact_rows:
+        _mark_synced(AmoContact, [r['id'] for r in dedup_by_id(contact_rows)], run_start)
+    if company_rows:
+        _mark_synced(AmoCompany, [r['id'] for r in dedup_by_id(company_rows)], run_start)
+
+
+
+def _collect_leads_batch(batch: List[Lead], run_start: datetime,
+                         is_full: bool) -> None:
+    relevant = []
+    for l in batch:
+        if not is_full and l.status_id == 143:
+            continue
+        relevant.append(l)
+    if not relevant:
+        return
+
+    crm_ids = [l.id for l in relevant]
+    logins = list({lead_login(l) for l in relevant if lead_login(l)})
+
+    existing_by_id = fetch_amo_leads_by_ids(crm_ids)
+    by_customer_login = fetch_abstract_customer_ids_by_customer_login(logins)
+
+    resolved: Dict[int, int] = {}       # lead crm_id -> abstract_customer_id
+    merges: List[Tuple[int, int]] = []  # (source_ac_id, target_ac_id)
+    new_leads: List[Lead] = []
+
+    for l in relevant:
+        login = lead_login(l)
+        existing = existing_by_id.get(l.id)
+        if existing is not None:
+            target = existing.abstract_customer_id
+            resolved[l.id] = target
+            # Если сделка нашлась по id и есть покупатель с тем же
+            # логином в другой склейке, сливаем в ту, что нашли по сделке
+            # вторая удаляется.
+            if login:
+                candidates = by_customer_login.get(login, [])
+                if len(candidates) > 1:
+                    logger.warning("Lead %s login %s: more than one abstract_customer %s",
+                                   l.id, login, candidates)
+                elif len(candidates) == 1 and candidates[0] != target:
+                    merges.append((candidates[0], target))
+            continue
+
+        # по id не нашли - ищем по логину среди покупателей
+        if login:
+            candidates = by_customer_login.get(login, [])
+            if len(candidates) == 1:
+                resolved[l.id] = candidates[0]
+                continue
+            if len(candidates) > 1:
+                logger.warning("Lead %s login %s: more than one abstract_customer %s -- create new",
+                               l.id, login, candidates)
+        # ничего не нашли - создаём новую склейку
+        new_leads.append(l)
+
+    # Создаём склейки под новые сделки.
+    if new_leads:
+        new_rows = [{'send_methods': None} for _ in new_leads]
+        inserted_ids = insert_abstract_customers(new_rows)
+        if len(inserted_ids) != len(new_leads):
+            raise RuntimeError("insert_abstract_customers: cannot map ids for leads")
+        for l, ac_id in zip(new_leads, inserted_ids):
+            resolved[l.id] = ac_id
+
+    # Слияния: переносим сущности из source на target, source удаляем.
+    merge_pairs = {(s, t) for s, t in merges if s != t}
+    if merge_pairs:
+        by_source: Dict[int, int] = {}
+        for s, t in merge_pairs:
+            if s not in by_source:
+                by_source[s] = t
+            elif by_source[s] != t:
+                logger.warning("Merge conflict for source %s: targets %s and %s, use %s",
+                               s, by_source[s], t, by_source[s])
+        for source, target in by_source.items():
+            reassign_entities_to_customer([source], target)
+            for lead_id, ac_id in list(resolved.items()):
+                if ac_id == source:
+                    resolved[lead_id] = target
+        delete_abstract_customers(list(by_source.keys()))
+
+    # Готовим строки amo_lead и вложенные контакты.
+    lead_rows = [lead_row(l, resolved[l.id]) for l in relevant]
+    contact_rows: List[Dict] = []
+    for l in relevant:
+        ac_id = resolved[l.id]
+        for contact in (l.contacts or []):
+            if contact.get('id') is None:
+                continue
+            contact_rows.append(contact_row(contact, ac_id))
+
+    upsert_leads(lead_rows)
+    upsert_contacts(contact_rows)
+
+    _mark_synced(AmoLead, [l.id for l in relevant], run_start)
+    if contact_rows:
+        _mark_synced(AmoContact, [r['id'] for r in dedup_by_id(contact_rows)], run_start)
+
+
+
+def _cleanup(run_start: datetime):
+    """Удаляем всё, что не было в текущей выгрузке (synced_at < run_start),
+    плюс сущности с «удалить» в имени, плюс пустые склейки.
+    """
+    logger.info("Cleanup: stale entities (synced_at < %s)", run_start)
+
+
+    for model in (AmoContact, AmoCompany, AmoLead, AmoCustomer):
+        deleted = db.session.execute(
+            model.__table__.delete().where(model.synced_at < run_start)
+        ).rowcount
+        logger.info("  %s: deleted %s stale", model.__tablename__, deleted)
+
+    for model in (AmoLead, AmoCustomer, AmoContact, AmoCompany):
+        deleted = db.session.execute(
+            model.__table__.delete().where(
+                func.coalesce(func.lower(model.name), '').contains('удалить')
+            )
+        ).rowcount
+        logger.info("  %s: deleted %s with 'удалить' in name", model.__tablename__, deleted)
+
+    # Склейки без каких-либо сущностей.
+    orphan_ac = db.session.execute(
+        select(AbstractCustomer.id).where(
+            ~AbstractCustomer.customers.any(),
+            ~AbstractCustomer.leads.any(),
+            ~AbstractCustomer.contacts.any(),
+            ~AbstractCustomer.companies.any(),
         )
-        db.session.execute(stmt)
+    ).scalars().all()
+    if orphan_ac:
+        db.session.execute(
+            AbstractCustomer.__table__.delete().where(AbstractCustomer.id.in_(orphan_ac))
+        )
+        logger.info("  abstract_customer: deleted %s empty", len(orphan_ac))
+
+
+
+def collect_leads_customers(is_full: bool = True):
+    """Ночная синхронизация CRM -> Postgres.
+
+    Полный проход (is_full=True):
+      1) покупатели батчами -> upsert amo_customer + контакты/компании;
+      2) сделки батчами -> resolve/merge -> upsert amo_lead + контакты;
+      3) удаление всего, чего не было в выгрузке (по synced_at) + «удалить»
+         в имени + пустые склейки.
+    Если сбор прервался исключением -- удаление не запускается.
+    """
+    run_start = _now()
+
+    try:
+        logger.info("Collect customers is_full=%s", is_full)
+        for batch in _chunks(amocrm_get(Customer, _with=f"{COMPANIES},{CONTACTS}"),
+                             BATCH_SIZE):
+            _collect_customers_batch(batch, run_start, is_full)
+            db.session.commit()
+
+        logger.info("Collect leads is_full=%s", is_full)
+        for batch in _chunks(amocrm_get(Lead, _with=f"{CONTACTS}"), BATCH_SIZE):
+            _collect_leads_batch(batch, run_start, is_full)
+            db.session.commit()
+    except Exception:
+        logger.exception("Collection failed -- rollback, cleanup skipped")
+        db.session.rollback()
+        raise
+
+    if not is_full:
+        return
+
+    try:
+        _cleanup(run_start)
         db.session.commit()
-        logger.info("Чистка покупателей на уровне сущностей")
-        for abc_customer in db.session.scalars(select(AbstractCustomer)).all():
-            filter_abc_customer(abc_customer=abc_customer, ids_map=ids_map)
-    except Exception as e:
-        logger.exception(f"Чистка: {e}")
-
-
-def filter_merge_abstract_customer(abc_customer: AbstractCustomer, attr: str,
-                                   check_ids: List[int]):
-    entity = abc_customer.__getattribute__(attr)
-    for l in entity:
-        entity = [c for c in entity if
-                  'удалить' not in l['general'].get('name').lower() and l['general'].get('id') in check_ids]
-        setattr(abc_customer, attr, entity)
-        flag_modified(abc_customer, attr)
-        db.session.commit()
-
-
-def filter_abc_customer(abc_customer: AbstractCustomer, ids_map: Dict):
-    if abc_customer.amo_leads:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_leads",
-                                           check_ids=ids_map[abc_customer.id]["leads"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_customers:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_customers",
-                                           check_ids=ids_map[abc_customer.id]["customers"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_contacts:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_contacts",
-                                           check_ids=ids_map[abc_customer.id]["contacts"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_companies:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_companies",
-                                           check_ids=ids_map[abc_customer.id]["companies"])
-        except Exception as e:
-            logger.exception(e)
-    if not abc_customer.amo_leads and not abc_customer.amo_customers:
-        db.session.flush()
-        db.session.delete(abc_customer)
-    db.session.commit()
+    except Exception:
+        logger.exception("Cleanup failed -- rollback")
+        db.session.rollback()
+        raise
